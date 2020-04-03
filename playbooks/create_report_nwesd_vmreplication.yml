@@ -1,0 +1,104 @@
+---
+- hosts: hyperv_systems
+  tasks:
+
+  - name: Create directories for output
+    file:
+      path: "{{ item.path }}"
+      state: directory
+      owner: "{{ item.owner | default(omit) }}"
+      group: "{{ item.group | default(omit) }}"
+      mode: "{{ item.mode | default(omit) }}"
+    loop_control:
+      label: "{{ item.path }}"
+    loop:
+    - path: "{{hostvars['localhost']['project_dir']}}/data/"
+    - path: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/"
+    when: inventory_hostname == 'localhost'
+
+  - name: Get VMReplication Status
+    win_shell: |
+      [array]$results = Get-VMReplication |
+      Select-Object -Property VMName, ReplicationFrequencySec,
+                              PrimaryServerName, ReplicaServerName, ReplicaServerPort,
+                              @{Name="ReplicationState"; Expression={$_.ReplicationState.ToString() }},
+                              @{Name="ReplicationMode"; Expression={$_.ReplicationMode.ToString() }},
+                              @{Name="ReplicationRelationshipType"; Expression={$_.ReplicationRelationshipType.ToString() }},
+                              @{Name="AuthenticationType"; Expression={$_.AuthenticationType.ToString() }},
+                              @{Name="ReplicationHealth"; Expression={$_.ReplicationHealth.ToString() }}|
+      Sort-Object -Property ReplicaServerName, VMName
+      ConvertTo-Json -InputObject $results -Depth 99
+    args:
+      no_profile: yes
+    register: replication_results
+    when: inventory_hostname != 'localhost'
+
+  - name: Save results
+    copy:
+      content: |
+        {% if replication_results.stdout != '' %}
+        {{ replication_results.stdout | from_json | to_nice_yaml(indent=2) }}
+        {% endif %}
+      dest: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/replication_{{ inventory_hostname_short }}.yml"
+    delegate_to: localhost
+    when: inventory_hostname != 'localhost'
+
+  - include_role:
+      name: template_html_base
+    when: inventory_hostname == 'localhost'
+    vars:
+      output_path: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/replication__summary.html"
+      template_flags:
+        enable_datatables: yes
+      template_data:
+        title: VM Replication Summary
+        content: |
+          <div>Report generated at {{ ansible_date_time.iso8601 }}</div>
+          <table id='results_table'>
+          <thead>
+          <tr>
+            <th>VMHost</th>
+            <th>VMName</th>
+            <th>Mode</th>
+            <th>Health</th>
+            <th>PrimaryServer</th>
+            <th>ReplicaServer</th>
+            <th>AuthType</th>
+            <th>Port</th>
+            <th>FrequencySec</th>
+            <th>State</th>
+            <th>RelationshipType</th>
+          </tr>
+          </thead>
+          <tbody>
+          {% for item_host in ansible_play_hosts_all %}
+          {% if hostvars[item_host].replication_results is defined and
+                hostvars[item_host].replication_results.stdout is defined and
+                hostvars[item_host].replication_results.stdout != '' %}
+          {% for item in (hostvars[item_host].replication_results.stdout | from_json) %}
+          <tr class="{{ 'text-danger' if 'Normal' != item.ReplicationHealth else '' }}">
+            <td>{{ item_host|lower() }}</td>
+            <td>{{ item.VMName|lower() }}</td>
+            <td>{{ item.ReplicationMode }}</td>
+            <td>{{ item.ReplicationHealth }}</td>
+            <td>{{ item.PrimaryServerName|lower() }}</td>
+            <td>{{ item.ReplicaServerName|lower() }}</td>
+            <td>{{ item.AuthenticationType }}</td>
+            <td>{{ item.ReplicaServerPort }}</td>
+            <td>{{ item.ReplicationFrequencySec }}</td>
+            <td>{{ item.ReplicationState }}</td>
+            <td>{{ item.ReplicationRelationshipType }}</td>
+          </tr>
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+          </tbody>
+          </table>
+          <script>
+          $(document).ready( function () {
+            $('#results_table').DataTable( {
+              'paging': false,
+              "order": [[ 3, 'asc' ], [ 0, 'asc' ], [ 1, 'asc' ], [ 2, 'asc' ]]
+            } );
+          } );
+          </script>

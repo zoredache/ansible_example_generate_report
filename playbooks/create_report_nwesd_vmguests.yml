@@ -1,0 +1,360 @@
+---
+- hosts: hyperv_systems
+  tasks:
+
+  - name: Create directories for output
+    file:
+      path: "{{ item.path }}"
+      state: directory
+      owner: "{{ item.owner | default(omit) }}"
+      group: "{{ item.group | default(omit) }}"
+      mode: "{{ item.mode | default(omit) }}"
+    loop_control:
+      label: "{{ item.path }}"
+    loop:
+    - path: "{{hostvars['localhost']['project_dir']}}/data/"
+    - path: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/"
+    when: inventory_hostname == 'localhost'
+
+  - name: Get VM Guests
+    register: vmguests
+    when: inventory_hostname != 'localhost'
+    args:
+      no_profile: yes
+    changed_when: no
+    win_shell: |
+      $VMType = [ordered]@{
+        "VMName" = $null
+        "VMId" = $null
+        "Path" = $null
+        "VMHost" = $null
+        "DynamicMemoryEnabled" = $null
+        "MemoryMaximum" = $null
+        "MemoryMinimum" = $null
+        "MemoryStartup" = $null
+        "ProcessorCount" = $null
+        "Generation" = $null
+        "Version" = $null
+        "PrimaryOperationalStatus" = $null
+        "PrimaryStatusDescription" = $null
+        "State" = $null
+        "AutomaticStartAction" = $null
+        "AutomaticStartDelay" = $null
+        "AutomaticStopAction" = $null
+        "AutomaticCriticalErrorAction" = $null
+        "ReplicationHealth" = $null
+        "ReplicationMode" = $null
+        "ReplicationState" = $null
+        "Uptime" = $null
+        "Notes" = $null
+        "PrimaryServerName" = $null
+        "ReplicaServerName" = $null
+        "ReplicationErrors" = $null
+        "SuccessfulReplicationCount" = $null
+        "MissedReplicationCount" = $null
+        "PendingReplicationSize" = $null
+        "AverageReplicationSize" = $null
+        "MaximumReplicationSize" = $null
+        "LastReplicationTime" = $null
+        "ReplicationRelationshipType" = $null
+      }
+      $VMType = New-Object -TypeName PSObject -Property $VMType
+      [array]$VMGuests=
+      Get-VM |
+      Sort-Object VMName |
+      ForEach-Object {
+        $VM = $VMType.PsObject.Copy()
+        $VM.VMHost = $_.ComputerName.ToLower()
+        $VM.VMName = $_.VMName
+        $VM.VMId = $_.VMId
+        $VM.Path = $_.Path
+        $VM.DynamicMemoryEnabled = $_.DynamicMemoryEnabled
+        $VM.MemoryMaximum = $_.MemoryMaximum
+        $VM.MemoryMinimum = $_.MemoryMinimum
+        $VM.MemoryStartup = $_.MemoryStartup
+        $VM.ProcessorCount = $_.ProcessorCount
+        $VM.Generation = $_.Generation
+        $VM.Version = $_.Version
+        $VM.PrimaryStatusDescription = $_.PrimaryStatusDescription
+        $VM.PrimaryOperationalStatus = $_.PrimaryOperationalStatus.ToString()
+        $VM.State = $_.State.ToString()
+        $VM.AutomaticStartAction = $_.AutomaticStartAction.ToString()
+        $VM.AutomaticStartDelay = $_.AutomaticStartDelay.ToString()
+        $VM.AutomaticStopAction = $_.AutomaticStopAction.ToString()
+        $VM.AutomaticCriticalErrorAction = $_.AutomaticCriticalErrorAction.ToString()
+        $VM.ReplicationHealth = $_.ReplicationHealth.ToString()
+        $VM.ReplicationMode = $_.ReplicationMode.ToString()
+        $VM.ReplicationState = $_.ReplicationState.ToString()
+        $VM.Uptime = "{0} days {1} hours {2} minutes" -f $_.Uptime.Days, $_.Uptime.Hours, $_.Uptime.Minutes
+        $VM.Notes = $_.Notes
+        $VM
+      }
+
+      Measure-VMReplication |
+      Sort-Object VMName |
+      ForEach-Object {
+        $VMName = $_.VMName
+        $VM=$VMGuests|Where-Object {$_.VMName -eq $VMName}
+        $VM.PrimaryServerName = $_.PrimaryServerName
+        $VM.ReplicaServerName = $_.ReplicaServerName
+        $VM.ReplicationErrors = $_.ReplicationErrors
+        $VM.SuccessfulReplicationCount = $_.SuccessfulReplicationCount
+        $VM.MissedReplicationCount = $_.MissedReplicationCount
+        $VM.PendingReplicationSize = $_.PendingReplicationSize
+        $VM.AverageReplicationSize = $_.AverageReplicationSize
+        $VM.MaximumReplicationSize = $_.MaximumReplicationSize
+        $VM.LastReplicationTime = $_.LastReplicationTime.ToString()
+        $VM.ReplicationRelationshipType = $_.ReplicationRelationshipType.ToString()
+      }
+
+      ConvertTo-Json $VMGuests
+
+  - name: Store VMGuests in a fact
+    set_fact:
+      vmguests: >
+        {{ [] if '' == vmguests.stdout else vmguests.stdout | default([]) | from_json }}
+    when: inventory_hostname != 'localhost'
+
+  - name: Save results per host
+    copy:
+      content: "{{ vmguests | to_nice_json(indent=2) }}"
+      dest: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/guests_{{ inventory_hostname_short }}.json"
+    delegate_to: localhost
+    when: inventory_hostname != 'localhost'
+
+  - name: Save summary results
+    copy:
+      content: "{{
+          ( groups['hyperv_systems'] |
+            map('extract',hostvars) |
+            selectattr('vmguests','defined') |
+            map(attribute='vmguests') |
+            list |
+            flatten) | to_nice_json(indent=2) }}"
+      dest: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/guests_summary.json"
+    when: inventory_hostname == 'localhost'
+
+  - include_role:
+      name: template_html_base
+    when: inventory_hostname == 'localhost'
+    vars:
+      output_path: "{{hostvars['localhost']['project_dir']}}/data/hyperv_status/guests_summary.html"
+      support_files:
+      - details_close.png
+      - details_open.png
+      template_flags:
+        enable_datatables: yes
+        jquery: minified
+      template_data:
+        title: Hyper-V Guests
+        css: |
+          <style>
+          td.details-control {
+              background: url('details_open.png') no-repeat center center;
+              cursor: pointer;
+          }
+          tr.shown td.details-control {
+              background: url('details_close.png') no-repeat center center;
+          }
+          </style>
+        content: |
+          <div>Data generated <span id="json-date"></span></div>
+
+          <table id="results" class="display" style="width:100%">
+              <thead>
+                  <tr>
+                      <th></th>
+                      <th>VMHost</th>
+                      <th>VMName</th>
+                      <th>State</th>
+                      <th>Status Description</th>
+                      <th>Replication Mode</th>
+                      <th>Replication Health</th>
+                  </tr>
+              </thead>
+          </table>
+          <script>
+          function format(d) {
+              // `d` is the original data object for the row
+              return '<table cellpadding="5" cellspacing="0" border="0" style="padding-left:50px;">' +
+                  '<tr>' +
+                  '<td>VMName:</td>' +
+                  '<td>' + d.VMName + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>VMId:</td>' +
+                  '<td>' + d.VMId + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>VMHost:</td>' +
+                  '<td>' + d.VMHost + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Path:</td>' +
+                  '<td>' + d.Path + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Notes:</td>' +
+                  '<td>' + d.Notes + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Generation:</td>' +
+                  '<td>' + d.Generation + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Version:</td>' +
+                  '<td>' + d.Version + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>PrimaryOperationalStatus:</td>' +
+                  '<td>' + d.PrimaryOperationalStatus + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>PrimaryStatusDescription:</td>' +
+                  '<td>' + d.PrimaryStatusDescription + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>State:</td>' +
+                  '<td>' + d.State + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>AutomaticStartAction:</td>' +
+                  '<td>' + d.AutomaticStartAction + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>AutomaticStartDelay:</td>' +
+                  '<td>' + d.AutomaticStartDelay + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>AutomaticStopAction:</td>' +
+                  '<td>' + d.AutomaticStopAction + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>AutomaticCriticalErrorAction:</td>' +
+                  '<td>' + d.AutomaticCriticalErrorAction + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicationHealth:</td>' +
+                  '<td>' + d.ReplicationHealth + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicationMode:</td>' +
+                  '<td>' + d.ReplicationMode + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicationState:</td>' +
+                  '<td>' + d.ReplicationState + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Uptime:</td>' +
+                  '<td>' + d.Uptime + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>PrimaryServerName:</td>' +
+                  '<td>' + d.PrimaryServerName + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicaServerName:</td>' +
+                  '<td>' + d.ReplicaServerName + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicationErrors:</td>' +
+                  '<td>' + d.ReplicationErrors + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>SuccessfulReplicationCount:</td>' +
+                  '<td>' + d.SuccessfulReplicationCount + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>MissedReplicationCount:</td>' +
+                  '<td>' + d.MissedReplicationCount + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>PendingReplicationSize:</td>' +
+                  '<td>' + d.PendingReplicationSize + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>AverageReplicationSize:</td>' +
+                  '<td>' + d.AverageReplicationSize + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>MaximumReplicationSize:</td>' +
+                  '<td>' + d.MaximumReplicationSize + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>LastReplicationTime:</td>' +
+                  '<td>' + d.LastReplicationTime + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>ReplicationRelationshipType:</td>' +
+                  '<td>' + d.ReplicationRelationshipType + '</td>' +
+                  '</tr>' +
+                  '</table>';
+          }
+
+          $(document).ready(function() {
+              $.ajax({
+                  async: true,
+                  url: 'guests_summary.json',
+                  method: 'HEAD',
+                  success: function( data, status, req ) {
+                      var moddate = new Date(Date.parse(req.getResponseHeader('Last-Modified')));
+                      $('span#json-date').text( moddate.toISOString() );
+                  }
+              });
+
+              var table = $('#results').DataTable( {
+                  'paging': false,
+                  "ajax": {
+                      "url": "guests_summary.json",
+                      "dataSrc": ""
+                  },
+                  "order": [[ 1, "asc" ], [ 1, "asc" ]],
+                  "createdRow": function( row, data, dataIndex ) {
+                    console.log(data.ReplicationMode);
+                    if ( data.PrimaryStatusDescription != "Operating normally" &&
+                         data.PrimaryOperationalStatus != "OK" &&
+                         (data.ReplicationRelationshipType == "Simple" &&
+                          (data.MissedReplicationCount > 0 ||
+                           data.ReplicationErrors > 0) ) ) {
+                      $(row).addClass( 'text-danger' );
+                    }
+                    if ( data.ReplicationMode == "Replica" ||
+                         data.State != 'Running' ) {
+                      $(row).addClass( 'text-info' );
+                    }
+                  },
+                  "columns": [
+                      {
+                          "className": 'details-control',
+                          "orderable": false,
+                          "data": null,
+                          "defaultContent": ''
+                      },
+                      { "data": "VMHost" },
+                      { "data": "VMName" },
+                      { "data": "State" },
+                      { "data": "PrimaryStatusDescription" },
+                      { "data": "ReplicationMode" },
+                      { "data": "ReplicationHealth" }
+                  ]
+              } );
+
+              // Add event listener for opening and closing details
+              $('#results tbody').on('click', 'td.details-control', function () {
+                  var tr = $(this).closest('tr');
+                  var row = table.row(tr);
+
+                  if (row.child.isShown()) {
+                      // This row is already open - close it
+                      row.child.hide();
+                      tr.removeClass('shown');
+                  }
+                  else {
+                      // Open this row
+                      row.child(format(row.data())).show();
+                      tr.addClass('shown');
+                  }
+              });
+          } );
+          </script>

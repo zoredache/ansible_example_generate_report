@@ -1,0 +1,14 @@
+---
+- name: Upload support files
+  copy:
+    src: "{{ item }}"
+    dest: "{{ output_path | dirname }}"
+  loop: "{{ support_files | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: (support_files | default([]) | length) > 0
+- name: Write file {{ template_data.title | default(output_path) }}
+  template:
+    src: base.html.j2
+    dest: "{{ output_path }}"
+  when: output_path is defined and template_data is defined

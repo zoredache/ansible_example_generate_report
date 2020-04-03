@@ -1,0 +1,322 @@
+---
+- name: Prepare system for generating the report
+  hosts: localhost
+  tags: always
+  tasks:
+
+  - name: Create directories for output
+    file:
+      path: "{{ item.path }}"
+      state: directory
+      owner: "{{ item.owner | default(omit) }}"
+      group: "{{ item.group | default(omit) }}"
+      mode: "{{ item.mode | default(omit) }}"
+    loop_control:
+      label: "{{ item.path }}"
+    loop:
+    - path: "{{hostvars['localhost']['project_dir']}}/data/"
+    - path: "{{hostvars['localhost']['project_dir']}}/data/needed_updates/"
+    run_once: yes
+    delegate_to: localhost
+
+- name: Scan Linux systems for updates
+  hosts: linux_systems
+  tags: linux
+  gather_facts: yes
+  vars:
+    linux_releases:
+      Debian_etch: { 'eol': true }
+      Debian_lenny: { 'eol': true }
+      Debian_squeeze: { 'eol': true }
+      Debian_wheezy: { 'eol': true }
+      Debian_jessie: { 'eol': true }
+      Debian_stretch: { 'eol': false }
+      Debian_buster: { 'eol': false }
+      Ubuntu_xenial: { 'eol': false }
+      Ubuntu_bionic: { 'eol': false }
+
+  tasks:
+
+  - name: Verify that we are on a supported release
+    assert:
+      that:
+      - ansible_pkg_mgr == 'apt'
+      - ansible_lsb is defined
+      - linux_releases[ansible_distribution~'_'~ansible_distribution_release] is defined
+
+  - name: Update packages list
+    apt:
+      update_cache: yes
+      cache_valid_time: '{{ apt_cache_valid_time | default(900) }}'
+    changed_when: no
+    ignore_errors: true
+    tags:
+    - aptupdate
+
+  - name: Get updates needed
+    register: apt_updats_needed
+    shell: /usr/bin/apt-get --just-print dist-upgrade  | awk '/^Inst / {print}' | sort
+    changed_when: no
+    args:
+      warn: off
+
+  - name: Define variables for report
+    set_fact:
+      os_release: "{{ ansible_distribution~'_'~ansible_distribution_release }}"
+      pending_update_count: "{{ apt_updats_needed.stdout_lines | count }}"
+      pending_update: |
+        [
+        {% for i in apt_updats_needed.stdout_lines %}
+        {% if i|regex_search('^Inst ([^ ]+) \(([^ ]+) ([^ ]+).*\).*$') %}
+        {{ i | regex_replace (
+          '^Inst ([^ ]+) \(([^ ]+) ([^ ]+).*\).*$',
+          '{  "title": "\1 \2", "id": "\1 \2", "package": "\1", "source": "\3", "state": "new" }'
+        ) }},
+        {% elif i|regex_search('^Inst ([^ ]+)(?: \[(.*?)\])? \(([^ ]+) ([^ ]+).*\).*$') %}
+        {{ i | regex_replace (
+          '^Inst ([^ ]+)(?: \[(.*?)\])? \(([^ ]+) ([^ ]+).*\).*$',
+          '{  "title": "\1 \3", "id": "\1 \3", "package": "\1", "replacing": "\1 \2","source": "\4", "state": "upgrade" }'
+        ) }},
+        {% else %}
+        {"title": "error {{ i }}"}
+        {% endif %}
+        {% endfor %}
+        ]
+      apt_updats_needed: ''
+      system_eol: "{{ linux_releases[ansible_distribution~'_'~ansible_distribution_release]['eol'] | default(true) }}"
+      uptime: "{{ ansible_uptime_seconds }}"
+      uptime_warn: "{{ (86400*28) < ansible_uptime_seconds }}"
+
+- name: Scan Windows systems for updates
+  hosts: windows_systems
+  tags: windows
+  gather_facts: yes
+  vars:
+    windows_releases:
+      'Microsoft Windows Server Standard': { 'eol': true }
+      'Microsoft Windows Server 2008 R2 Standard': { 'eol': true }
+      'Microsoft Hyper-V Server 2012 R2': { 'eol': false }
+      'Microsoft Windows Server 2012 R2 Standard': { 'eol': false }
+      'Microsoft Hyper-V Server 2016': { 'eol': false }
+      'Microsoft Windows Server 2016 Datacenter': { 'eol': false }
+      'Microsoft Windows Server 2016 Standard': { 'eol': false }
+      'Microsoft Windows Server 2019 Standard': { 'eol': false }
+      'Microsoft Windows 10 Enterprise': { 'eol': false }
+      'Microsoft Windows 10 Education': { 'eol': false }
+
+  tasks:
+  # - name: Verify that we are on a supported release
+  #   assert:
+  #     that:
+  #     # - ansible_pkg_mgr == 'apt'
+  #     # - ansible_lsb is defined
+  #     - windows_releases[ansible_distribution] is defined
+
+  - name: Get updates needed
+    win_updates:
+      category_names:
+        - SecurityUpdates
+        - CriticalUpdates
+        - UpdateRollups
+        - DefinitionUpdates
+        - Updates
+      reboot: no
+      state: searched
+    become: yes
+    become_method: runas
+    become_user: SYSTEM
+    register: win_updats_needed
+
+  - name: Define variables for report
+    set_fact:
+      os_release: "{{ ansible_distribution }}"
+      pending_update_count: "{{ win_updats_needed.found_update_count | int }}"
+      pending_update: "{{ win_updats_needed.updates | dict2items | map(attribute='value') | list }}"
+      apt_updats_needed: ''
+      system_eol: "{{ (windows_releases[ansible_distribution]|d({}))['eol'] | default(true) }}"
+      uptime: >-
+        {{ (( ((ansible_date_time.date+" "+ansible_date_time.time)|to_datetime('%Y-%m-%d %H:%M:%S')) -
+              ansible_facts.lastboot|to_datetime('%Y-%m-%d %H:%M:%SZ')).total_seconds())|abs }}
+      uptime_warn: >-
+        {{ (86400*28) <
+           (( ((ansible_date_time.date+" "+ansible_date_time.time)|to_datetime('%Y-%m-%d %H:%M:%S')) -
+             ansible_facts.lastboot|to_datetime('%Y-%m-%d %H:%M:%SZ')).total_seconds())|abs }}
+
+- name: Prepare system for generating the report
+  hosts: localhost:all
+  tags: always
+  gather_facts: no
+  tasks:
+
+  - name: Write output for each host
+    delegate_to: localhost
+    when: os_release is defined and
+          pending_update is defined and
+          pending_update_count is defined and
+          system_eol is defined
+    copy:
+      dest: "{{hostvars['localhost']['project_dir']}}/data/needed_updates/{{ inventory_hostname }}.yml"
+      content: |
+        ---
+        host: {{ inventory_hostname }}
+        os_release: {{ os_release }}
+        system_eol: {{ system_eol | default('yes') }}
+        uptime: {{ uptime }}
+        uptime_warn: {{ uptime_warn }}
+        update_count: {{ pending_update_count|int }}
+        updates:{{ '' if ((pending_update_count|int) != 0) else ' []' }}
+        {% for u in pending_update %}
+        - {{ u | to_json }}
+        {% endfor %}
+
+  - name: Generate json summary
+    delegate_to: localhost
+    run_once:  yes
+    copy:
+      dest: "{{hostvars['localhost']['project_dir']}}/data/needed_updates/summary.json"
+      content: |
+        [
+        {% for h in ansible_play_hosts_all|sort %}
+        {% if hostvars[h]['os_release'] is defined %}
+        {
+          "host": "{{ hostvars[h]['inventory_hostname'] }}",
+          "os_release": "{{ hostvars[h]['os_release'] | default() }}",
+          "system_eol": "{{ 'eol' if (hostvars[h]['system_eol'] | default(true)) else '' }}",
+          "uptime": "{{ hostvars[h]['uptime'] | default() }}",
+          "uptime_warn": {{ hostvars[h]['uptime_warn'] | default(true) }},
+          "update_count": "{{ hostvars[h]['pending_update_count'] | default() }}",
+          "updates": [
+          {% for u in hostvars[h]['pending_update'] %}
+          {{ u | to_json }},
+          {% endfor %}
+          ]
+        },
+        {% endif %}
+        {% endfor %}
+        ]
+
+  - include_role:
+      name: template_html_base
+    run_once: yes
+    when: inventory_hostname == 'localhost'
+    vars:
+      output_path: "{{hostvars['localhost']['project_dir']}}/data/needed_updates/summary.html"
+      support_files:
+      - details_close.png
+      - details_open.png
+      template_flags:
+        enable_datatables: yes
+        jquery: minified
+      template_data:
+        title: Servers - Pending Update Report
+        css: |
+          <style>
+          td.details-control {
+              background: url('details_open.png') no-repeat center center;
+              cursor: pointer;
+          }
+          tr.shown td.details-control {
+              background: url('details_close.png') no-repeat center center;
+          }
+          </style>
+        content: |
+          <div>Data generated <span id="json-date"></span></div>
+          <table id='results'>
+          <thead>
+          <tr>
+              <th></th>
+              <th>host</th>
+              <th>uptime</th>
+              <th>update_count</th>
+              <th>eol</th>
+              <th>release</th>
+          </tr>
+          </thead>
+          </table>
+          <script>
+          function format(d) {
+              // `d` is the original data object for the row
+              var data = '';
+              data +=
+                  '<table cellpadding="5" cellspacing="0" border="0" style="padding-left:50px; width:80%">' +
+                  '<tr>' +
+                  '<td>Host:</td>' +
+                  '<td>' + d.host + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>OS Release:</td>' +
+                  '<td>' + d.os_release + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>OS EOL:</td>' +
+                  '<td>' + d.system_eol + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Uptime:</td>' +
+                  '<td>' + d.uptime + '</td>' +
+                  '</tr>' +
+                  '<tr>' +
+                  '<td>Update Count:</td>' +
+                  '<td>' + d.update_count + '</td>' +
+                  '</tr>';
+              data +='<tr><td colspan="100%"><table>'+
+                  '<thead><tr><td>Updates</td></tr></thead>';
+              for (var i = 0; i < d.updates.length; i++) {
+                  data += '<tr><td>' + d.updates[i].title + '</td></tr>';
+              }
+              data += '</table></td></tr>';
+              data += '</table>';
+              return data;
+          }
+
+          $(document).ready(function() {
+              $.ajax({
+                  async: true,
+                  url: 'summary.json',
+                  method: 'HEAD',
+                  success: function( data, status, req ) {
+                      var moddate = new Date(Date.parse(req.getResponseHeader('Last-Modified')));
+                      $('span#json-date').text( moddate.toISOString() );
+                  }
+              });
+
+              var table = $('#results').DataTable( {
+                  'paging': false,
+                  "ajax": {
+                      "url": "summary.json",
+                      "dataSrc": ""
+                  },
+                  "order": [[ 1, "asc" ]],
+                  "columns": [
+                      {
+                          "className": 'details-control',
+                          "orderable": false,
+                          "data": null,
+                          "defaultContent": ''
+                      },
+                      { "data": "host" },
+                      { "data": "uptime_warn" },
+                      { "data": "update_count" },
+                      { "data": "system_eol" },
+                      { "data": "os_release" }
+                  ]
+              } );
+
+              // Add event listener for opening and closing details
+              $('#results tbody').on('click', 'td.details-control', function () {
+                  var tr = $(this).closest('tr');
+                  var row = table.row(tr);
+
+                  if (row.child.isShown()) {
+                      // This row is already open - close it
+                      row.child.hide();
+                      tr.removeClass('shown');
+                  }
+                  else {
+                      // Open this row
+                      row.child(format(row.data())).show();
+                      tr.addClass('shown');
+                  }
+              });
+          } );
+          </script>
